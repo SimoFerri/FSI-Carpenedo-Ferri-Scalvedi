@@ -1,0 +1,14 @@
+# Executables
+*.out
+*.exe
+
+# Build directory
+build
+build/*
+
+# Output files
+*.vtk
+
+# Config files
+.github
+.vscode

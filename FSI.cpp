@@ -49,6 +49,8 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/error_estimator.h>
  
+#include <deal.II/numerics/vector_tools.h>
+
 #include <iostream>
 #include <fstream>
  
@@ -64,7 +66,7 @@ namespace Step46
   public:
     FluidStructureProblem(const unsigned int stokes_degree,
                           const unsigned int elasticity_degree);
-    void run();
+    void run(const unsigned int max_cycles, const float tol);
  
   private:
     enum
@@ -93,7 +95,7 @@ namespace Step46
       FullMatrix<double> &                  local_interface_matrix) const;
     void solve();
     void output_results(const unsigned int refinement_cycle) const;
-    void refine_mesh();
+    float refine_mesh(float tol);
  
     const unsigned int stokes_degree;
     const unsigned int elasticity_degree;
@@ -690,7 +692,7 @@ namespace Step46
  
  
   template <int dim>
-  void FluidStructureProblem<dim>::refine_mesh()
+  float FluidStructureProblem<dim>::refine_mesh(float tol)
   {
     Vector<float> stokes_estimated_error_per_cell(
       triangulation.n_active_cells());
@@ -723,10 +725,10 @@ namespace Step46
       fe_collection.component_mask(displacements));
  
     stokes_estimated_error_per_cell *=
-      4. / stokes_estimated_error_per_cell.l2_norm();
+      4.0f / stokes_estimated_error_per_cell.l2_norm();
     elasticity_estimated_error_per_cell *=
-      1. / elasticity_estimated_error_per_cell.l2_norm();
- 
+      1.0f / elasticity_estimated_error_per_cell.l2_norm();
+
     Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
  
     estimated_error_per_cell += stokes_estimated_error_per_cell;
@@ -763,28 +765,35 @@ namespace Step46
               estimated_error_per_cell(cell->active_cell_index()) = 0;
           }
  
-    GridRefinement::refine_and_coarsen_fixed_number(triangulation,
-                                                    estimated_error_per_cell,
-                                                    0.3,
-                                                    0.0);
-    triangulation.execute_coarsening_and_refinement();
+    float estimated_error_norm = estimated_error_per_cell.l2_norm();
+    
+    if (estimated_error_norm > tol)
+      {
+        GridRefinement::refine_and_coarsen_fixed_number(triangulation,
+                                                        estimated_error_per_cell,
+                                                        0.3,
+                                                        0.0);
+        triangulation.execute_coarsening_and_refinement();
+      }
+    return estimated_error_norm;
   }
  
  
  
  
   template <int dim>
-  void FluidStructureProblem<dim>::run()
+  void FluidStructureProblem<dim>::run(const unsigned int max_cycles, const float tol)
   {
+    float estimated_error_norm = 0.0f;
     make_grid();
  
-    for (unsigned int refinement_cycle = 0; refinement_cycle < 10 - 2 * dim;
+    for (unsigned int refinement_cycle = 0; refinement_cycle < max_cycles;
          ++refinement_cycle)
       {
         std::cout << "Refinement cycle " << refinement_cycle << std::endl;
  
         if (refinement_cycle > 0)
-          refine_mesh();
+          estimated_error_norm = refine_mesh(tol);
  
         setup_dofs();
  
@@ -797,6 +806,21 @@ namespace Step46
         std::cout << "   Writing output..." << std::endl;
         output_results(refinement_cycle);
  
+        Point<dim> upper_right_solid_corner(0.25 - 1e-12, 0.5 - 1e-12);
+        Vector<double> value(fe_collection.n_components());
+        VectorTools::point_value(dof_handler, solution, upper_right_solid_corner, value);
+
+        std::cout << "   [Result logs] Displacement at (0.25, 0.5), upper right corner of the solid: ";
+        for(unsigned int i = dim + 1; i < fe_collection.n_components(); ++i) {
+          std::cout << value[i] << " ";
+        }
+        std::cout << std::endl;
+        if (refinement_cycle > 0)
+          {
+            std::cout << "   [Result logs] Estimated error per cell norm: " << estimated_error_norm << std::endl;
+            if (estimated_error_norm <= tol)
+              break;
+          }
         std::cout << std::endl;
       }
   }
@@ -812,7 +836,7 @@ int main()
       using namespace Step46;
  
       FluidStructureProblem<2> flow_problem(1, 1);
-      flow_problem.run();
+      flow_problem.run(100, 1e-4);
     }
   catch (std::exception &exc)
     {

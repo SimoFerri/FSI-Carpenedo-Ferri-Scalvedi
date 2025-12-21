@@ -36,6 +36,8 @@
 #include <deal.II/grid/grid_refinement.h>
  
 #include <deal.II/dofs/dof_tools.h>
+#include <deal.II/dofs/dof_renumbering.h>
+#include <deal.II/dofs/dof_handler.h>
  
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_nothing.h>
@@ -48,17 +50,72 @@
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/error_estimator.h>
+
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/lac/trilinos_vector.h>
+#include <deal.II/lac/trilinos_block_sparse_matrix.h>
+#include <deal.II/lac/trilinos_parallel_block_vector.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/solver_gmres.h>
  
 #include <deal.II/numerics/vector_tools.h>
 
 #include <iostream>
 #include <fstream>
- 
+
  
 namespace Step46
 {
   using namespace dealii;
  
+
+  class PreconditionBlockTriangular
+  {
+  public:
+    void
+    initialize(const TrilinosWrappers::BlockSparseMatrix &system_matrix_)
+    {
+      system_matrix = &system_matrix_;
+
+      A_fluid = &(system_matrix->block(0, 0));
+      A_solid = &(system_matrix->block(1, 1));
+      B = &(system_matrix->block(1, 0));
+      
+      preconditioner_fluid.initialize(*A_fluid);
+      preconditioner_solid.initialize(*A_solid);
+    };
+
+    void
+    vmult(TrilinosWrappers::MPI::BlockVector &dst, const TrilinosWrappers::MPI::BlockVector &src) const
+    {    
+      SolverControl solver_control_fluid(1000, 1e-4 * src.block(0).l2_norm());
+      SolverGMRES<TrilinosWrappers::MPI::Vector> gmres_fluid(solver_control_fluid);
+      dst.block(0) = 0;
+      gmres_fluid.solve(*A_fluid, dst.block(0), src.block(0), preconditioner_fluid);
+
+      tmp.reinit(src.block(1));
+      B->vmult(tmp, dst.block(0));
+      tmp.sadd(-1.0, src.block(1));
+
+      SolverControl solver_control_solid(1000, 1e-2 * src.block(1).l2_norm());
+      SolverCG<TrilinosWrappers::MPI::Vector> cg_solid(solver_control_solid);
+      dst.block(1) = 0;
+      cg_solid.solve(*A_solid, dst.block(1), tmp, preconditioner_solid);
+    };
+
+  protected:
+    const TrilinosWrappers::BlockSparseMatrix *system_matrix;
+
+    const TrilinosWrappers::SparseMatrix *A_fluid;
+    const TrilinosWrappers::SparseMatrix *A_solid;
+    const TrilinosWrappers::SparseMatrix *B;
+
+    TrilinosWrappers::PreconditionILU preconditioner_fluid;
+    TrilinosWrappers::PreconditionAMG preconditioner_solid;
+
+    mutable TrilinosWrappers::MPI::Vector tmp;
+  };
  
   template <int dim>
   class FluidStructureProblem
@@ -108,11 +165,10 @@ namespace Step46
  
     AffineConstraints<double> constraints;
  
-    SparsityPattern      sparsity_pattern;
-    SparseMatrix<double> system_matrix;
+    TrilinosWrappers::BlockSparseMatrix system_matrix;
  
-    Vector<double> solution;
-    Vector<double> system_rhs;
+    TrilinosWrappers::MPI::BlockVector solution;
+    TrilinosWrappers::MPI::BlockVector system_rhs;
  
     const double viscosity;
     const double lambda;
@@ -261,7 +317,12 @@ namespace Step46
   {
     set_active_fe_indices();
     dof_handler.distribute_dofs(fe_collection);
- 
+
+    std::vector<unsigned int> block_component(dim + 1 + dim, 0);
+    for (unsigned int c = dim + 1; c < dim + 1 + dim; ++c)
+      block_component[c] = 1;
+    DoFRenumbering::component_wise(dof_handler, block_component); 
+    
     {
       constraints.clear();
       DoFTools::make_hanging_node_constraints(dof_handler, constraints);
@@ -328,9 +389,19 @@ namespace Step46
               << std::endl
               << "   Number of degrees of freedom: " << dof_handler.n_dofs()
               << std::endl;
- 
+    
+    const std::vector<types::global_dof_index> dofs_per_block = 
+      DoFTools::count_dofs_per_fe_block(dof_handler, block_component);
+    const unsigned int n_fluid = dofs_per_block[0];
+    const unsigned int n_solid = dofs_per_block[1];
+
     {
-      DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
+      BlockDynamicSparsityPattern dsp(2, 2);
+      dsp.block(0, 0).reinit(n_fluid, n_fluid);
+      dsp.block(0, 1).reinit(n_fluid, n_solid);
+      dsp.block(1, 0).reinit(n_solid, n_fluid);
+      dsp.block(1, 1).reinit(n_solid, n_solid);
+      dsp.collect_sizes();
  
       Table<2, DoFTools::Coupling> cell_coupling(fe_collection.n_components(),
                                                  fe_collection.n_components());
@@ -354,13 +425,25 @@ namespace Step46
                                            cell_coupling,
                                            face_coupling);
       constraints.condense(dsp);
-      sparsity_pattern.copy_from(dsp);
+      system_matrix.reinit(dsp);
     }
- 
-    system_matrix.reinit(sparsity_pattern);
- 
-    solution.reinit(dof_handler.n_dofs());
-    system_rhs.reinit(dof_handler.n_dofs());
+     
+    IndexSet fluid_partitioning(n_fluid);
+    IndexSet solid_partitioning(n_solid);
+    fluid_partitioning.add_range(0, n_fluid);
+    solid_partitioning.add_range(0, n_solid);
+    fluid_partitioning.compress();
+    solid_partitioning.compress();
+
+    solution.reinit(2);
+    solution.block(0).reinit(fluid_partitioning, MPI_COMM_SELF);
+    solution.block(1).reinit(solid_partitioning, MPI_COMM_SELF);
+    solution.collect_sizes();
+
+    system_rhs.reinit(2);
+    system_rhs.block(0).reinit(fluid_partitioning, MPI_COMM_SELF);
+    system_rhs.block(1).reinit(solid_partitioning, MPI_COMM_SELF);
+    system_rhs.collect_sizes();
   }
  
  
@@ -592,6 +675,8 @@ namespace Step46
                   }
               }
       }
+      system_matrix.compress(VectorOperation::add);
+      system_rhs.compress(VectorOperation::add);
   }
  
  
@@ -647,9 +732,14 @@ namespace Step46
   template <int dim>
   void FluidStructureProblem<dim>::solve()
   {
-    SparseDirectUMFPACK direct_solver;
-    direct_solver.initialize(system_matrix);
-    direct_solver.vmult(solution, system_rhs);
+    SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
+
+    SolverGMRES<TrilinosWrappers::MPI::BlockVector> solver(solver_control);
+
+    PreconditionBlockTriangular preconditioner;
+    preconditioner.initialize(system_matrix);
+
+    solver.solve(system_matrix, solution, system_rhs, preconditioner);
  
     constraints.distribute(solution);
   }
@@ -829,11 +919,13 @@ namespace Step46
  
  
  
-int main()
+int main(int argc, char **argv)
 {
   try
     {
       using namespace Step46;
+
+      Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
  
       FluidStructureProblem<2> flow_problem(1, 1);
       flow_problem.run(100, 1e-4);

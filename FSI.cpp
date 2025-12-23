@@ -24,12 +24,19 @@
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/utilities.h>
+#include <deal.II/base/mpi.h>
  
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/full_matrix.h>
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparse_direct.h>
 #include <deal.II/lac/affine_constraints.h>
+#include <deal.II/lac/block_sparse_matrix.h>
+#include <deal.II/lac/block_vector.h>
+#include <deal.II/lac/solver_gmres.h>
+#include <deal.II/lac/precondition.h>
+#include <deal.II/lac/sparse_ilu.h>
+#include <deal.II/lac/trilinos_precondition.h>
  
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/grid_generator.h>
@@ -37,7 +44,6 @@
  
 #include <deal.II/dofs/dof_tools.h>
 #include <deal.II/dofs/dof_renumbering.h>
-#include <deal.II/dofs/dof_handler.h>
  
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_nothing.h>
@@ -50,73 +56,87 @@
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/error_estimator.h>
-
-#include <deal.II/lac/trilinos_precondition.h>
-#include <deal.II/lac/trilinos_sparse_matrix.h>
-#include <deal.II/lac/trilinos_vector.h>
-#include <deal.II/lac/trilinos_block_sparse_matrix.h>
-#include <deal.II/lac/trilinos_parallel_block_vector.h>
-#include <deal.II/lac/solver_cg.h>
-#include <deal.II/lac/solver_gmres.h>
  
 #include <deal.II/numerics/vector_tools.h>
 
 #include <iostream>
 #include <fstream>
-
+ 
  
 namespace Step46
 {
   using namespace dealii;
  
-
-  class PreconditionBlockTriangular
+  template <class MatrixType>
+  class BlockTriangularPreconditioner : public Subscriptor
   {
   public:
-    void
-    initialize(const TrilinosWrappers::BlockSparseMatrix &system_matrix_)
+    BlockTriangularPreconditioner(const MatrixType &system_matrix)
+      : system_matrix(&system_matrix)
     {
-      system_matrix = &system_matrix_;
+      // Decide whether to use AMG for solid block based on its size
+      const unsigned int solid_dofs = system_matrix.block(1, 1).m();
+      const bool is_large_problem = (solid_dofs > 50000);
 
-      A_fluid = &(system_matrix->block(0, 0));
-      A_solid = &(system_matrix->block(1, 1));
-      B = &(system_matrix->block(1, 0));
-      
-      preconditioner_fluid.initialize(*A_fluid);
-      preconditioner_solid.initialize(*A_solid);
-    };
+      // Initialize solver for A_fluid
+      fluid_solver_direct.initialize(system_matrix.block(0, 0));
 
-    void
-    vmult(TrilinosWrappers::MPI::BlockVector &dst, const TrilinosWrappers::MPI::BlockVector &src) const
-    {    
-      SolverControl solver_control_fluid(1000, 1e-4 * src.block(0).l2_norm());
-      SolverGMRES<TrilinosWrappers::MPI::Vector> gmres_fluid(solver_control_fluid);
-      dst.block(0) = 0;
-      gmres_fluid.solve(*A_fluid, dst.block(0), src.block(0), preconditioner_fluid);
+      // Initialize solver and preconditioner for A_solid
+      if (is_large_problem)
+      {
+        std::cout << "      Using AMG preconditioner for solid block" << std::endl;
+        use_amg_for_solid = true;
+        solid_preconditioner_amg.initialize(system_matrix.block(1, 1));
+      }
+      else
+      {
+        use_amg_for_solid = false;
+        solid_solver_direct.initialize(system_matrix.block(1, 1));
+      }
+    }
 
-      tmp.reinit(src.block(1));
-      B->vmult(tmp, dst.block(0));
-      tmp.sadd(-1.0, src.block(1));
+    // Applies the preconditioner: dst = P^-1 * src
+    // Corresponds to the matrix-vector multiplication:
+    // ( p_x )   (      A_fluid^-1                    0     ) ( x )
+    // ( p_y ) = ( -A_solid^-1 * B * A_fluid^-1  A_solid^-1 ) ( y )
+    void vmult(BlockVector<double> &dst, const BlockVector<double> &src) const
+    {
+      // Compute p_x = A_fluid^-1 * x
+      fluid_solver_direct.vmult(dst.block(0), src.block(0));
 
-      SolverControl solver_control_solid(1000, 1e-2 * src.block(1).l2_norm());
-      SolverCG<TrilinosWrappers::MPI::Vector> cg_solid(solver_control_solid);
-      dst.block(1) = 0;
-      cg_solid.solve(*A_solid, dst.block(1), tmp, preconditioner_solid);
-    };
+      // Compute y - B * p_x
+      Vector<double> tmp(src.block(1).size()); 
+      system_matrix->block(1, 0).vmult(tmp, dst.block(0));
+      tmp.sadd(-1.0, 1.0, src.block(1));
 
-  protected:
-    const TrilinosWrappers::BlockSparseMatrix *system_matrix;
+      // Compute p_y = A_solid^-1 * (y - B * p_x)
+      if (use_amg_for_solid)
+      {
+        // Use iterative solver with AMG preconditioner
+        SolverControl solid_control(5000, 1e-2 * tmp.l2_norm());
+        SolverCG<Vector<double>> solid_solver(solid_control);
+        
+        solid_solver.solve(system_matrix->block(1, 1),
+                           dst.block(1),
+                           tmp,
+                           solid_preconditioner_amg);
+      }
+      else
+      {
+        // Use direct solver
+        solid_solver_direct.vmult(dst.block(1), tmp);
+      }
+    }
 
-    const TrilinosWrappers::SparseMatrix *A_fluid;
-    const TrilinosWrappers::SparseMatrix *A_solid;
-    const TrilinosWrappers::SparseMatrix *B;
+  private:
+    const MatrixType *system_matrix;
+    bool use_amg_for_solid;
 
-    TrilinosWrappers::PreconditionILU preconditioner_fluid;
-    TrilinosWrappers::PreconditionAMG preconditioner_solid;
-
-    mutable TrilinosWrappers::MPI::Vector tmp;
+    SparseDirectUMFPACK fluid_solver_direct;
+    SparseDirectUMFPACK solid_solver_direct;
+    TrilinosWrappers::PreconditionAMG solid_preconditioner_amg;
   };
- 
+
   template <int dim>
   class FluidStructureProblem
   {
@@ -164,11 +184,13 @@ namespace Step46
     DoFHandler<dim>       dof_handler;
  
     AffineConstraints<double> constraints;
+    
+    // System matrix and vectors are block objects
+    BlockSparsityPattern      sparsity_pattern;
+    BlockSparseMatrix<double> system_matrix;
  
-    TrilinosWrappers::BlockSparseMatrix system_matrix;
- 
-    TrilinosWrappers::MPI::BlockVector solution;
-    TrilinosWrappers::MPI::BlockVector system_rhs;
+    BlockVector<double> solution;
+    BlockVector<double> system_rhs;
  
     const double viscosity;
     const double lambda;
@@ -318,11 +340,37 @@ namespace Step46
     set_active_fe_indices();
     dof_handler.distribute_dofs(fe_collection);
 
-    std::vector<unsigned int> block_component(dim + 1 + dim, 0);
-    for (unsigned int c = dim + 1; c < dim + 1 + dim; ++c)
-      block_component[c] = 1;
-    DoFRenumbering::component_wise(dof_handler, block_component); 
-    
+    // Renumbering DoFs: first all fluid DoFs, then all solid DoFs
+    std::vector<unsigned int> block_component(dim + 1 + dim);
+    for (unsigned int d = 0; d < dim + 1; ++d)
+      block_component[d] = 0;
+    for (unsigned int d = 0; d < dim; ++d)
+      block_component[dim + 1 + d] = 1;
+
+    DoFRenumbering::component_wise(dof_handler, block_component);
+
+    // Determine number of DoFs per block manually (find max DoF index in fluid)
+    types::global_dof_index max_fluid_index = 0;
+    std::vector<types::global_dof_index> local_dof_indices(stokes_fe.n_dofs_per_cell());
+
+    for (const auto &cell : dof_handler.active_cell_iterators())
+    {
+        if (cell_is_in_fluid_domain(cell))
+        {
+            cell->get_dof_indices(local_dof_indices);
+            for (auto index : local_dof_indices)
+                if (index > max_fluid_index)
+                    max_fluid_index = index;
+        }
+    }
+
+    std::vector<types::global_dof_index> dofs_per_block(2);
+    dofs_per_block[0] = max_fluid_index + 1;
+    dofs_per_block[1] = dof_handler.n_dofs() - dofs_per_block[0];
+
+    std::cout << "   DoFs: fluid=" << dofs_per_block[0] 
+              << ", solid=" << dofs_per_block[1] << std::endl;
+ 
     {
       constraints.clear();
       DoFTools::make_hanging_node_constraints(dof_handler, constraints);
@@ -389,25 +437,21 @@ namespace Step46
               << std::endl
               << "   Number of degrees of freedom: " << dof_handler.n_dofs()
               << std::endl;
-    
-    const std::vector<types::global_dof_index> dofs_per_block = 
-      DoFTools::count_dofs_per_fe_block(dof_handler, block_component);
-    const unsigned int n_fluid = dofs_per_block[0];
-    const unsigned int n_solid = dofs_per_block[1];
-
-    {
-      BlockDynamicSparsityPattern dsp(2, 2);
-      dsp.block(0, 0).reinit(n_fluid, n_fluid);
-      dsp.block(0, 1).reinit(n_fluid, n_solid);
-      dsp.block(1, 0).reinit(n_solid, n_fluid);
-      dsp.block(1, 1).reinit(n_solid, n_solid);
-      dsp.collect_sizes();
  
+    {
+      // Setup block sparsity pattern
+      BlockDynamicSparsityPattern dsp(2, 2);
+      dsp.block(0, 0).reinit(dofs_per_block[0], dofs_per_block[0]);
+      dsp.block(1, 0).reinit(dofs_per_block[1], dofs_per_block[0]); // Coupling
+      dsp.block(0, 1).reinit(dofs_per_block[0], dofs_per_block[1]); // Empty
+      dsp.block(1, 1).reinit(dofs_per_block[1], dofs_per_block[1]);
+      dsp.collect_sizes();
+
       Table<2, DoFTools::Coupling> cell_coupling(fe_collection.n_components(),
                                                  fe_collection.n_components());
       Table<2, DoFTools::Coupling> face_coupling(fe_collection.n_components(),
                                                  fe_collection.n_components());
- 
+  
       for (unsigned int c = 0; c < fe_collection.n_components(); ++c)
         for (unsigned int d = 0; d < fe_collection.n_components(); ++d)
           {
@@ -425,24 +469,20 @@ namespace Step46
                                            cell_coupling,
                                            face_coupling);
       constraints.condense(dsp);
-      system_matrix.reinit(dsp);
+      sparsity_pattern.copy_from(dsp);
     }
-     
-    IndexSet fluid_partitioning(n_fluid);
-    IndexSet solid_partitioning(n_solid);
-    fluid_partitioning.add_range(0, n_fluid);
-    solid_partitioning.add_range(0, n_solid);
-    fluid_partitioning.compress();
-    solid_partitioning.compress();
-
+ 
+    // Initialize system matrix and vectors
+    system_matrix.reinit(sparsity_pattern);
+ 
     solution.reinit(2);
-    solution.block(0).reinit(fluid_partitioning, MPI_COMM_SELF);
-    solution.block(1).reinit(solid_partitioning, MPI_COMM_SELF);
+    solution.block(0).reinit(dofs_per_block[0]);
+    solution.block(1).reinit(dofs_per_block[1]);
     solution.collect_sizes();
 
     system_rhs.reinit(2);
-    system_rhs.block(0).reinit(fluid_partitioning, MPI_COMM_SELF);
-    system_rhs.block(1).reinit(solid_partitioning, MPI_COMM_SELF);
+    system_rhs.block(0).reinit(dofs_per_block[0]);
+    system_rhs.block(1).reinit(dofs_per_block[1]);
     system_rhs.collect_sizes();
   }
  
@@ -453,7 +493,8 @@ namespace Step46
   void FluidStructureProblem<dim>::assemble_system()
   {
     system_matrix = 0;
-    system_rhs    = 0;
+    system_rhs.block(0) = 0;
+    system_rhs.block(1) = 0;
  
     const QGauss<dim> stokes_quadrature(stokes_degree + 2);
     const QGauss<dim> elasticity_quadrature(elasticity_degree + 2);
@@ -675,8 +716,6 @@ namespace Step46
                   }
               }
       }
-      system_matrix.compress(VectorOperation::add);
-      system_rhs.compress(VectorOperation::add);
   }
  
  
@@ -732,16 +771,16 @@ namespace Step46
   template <int dim>
   void FluidStructureProblem<dim>::solve()
   {
-    SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
+    BlockTriangularPreconditioner<BlockSparseMatrix<double>> preconditioner(system_matrix);
 
-    SolverGMRES<TrilinosWrappers::MPI::BlockVector> solver(solver_control);
-
-    PreconditionBlockTriangular preconditioner;
-    preconditioner.initialize(system_matrix);
+    SolverControl solver_control(5000, 1e-8 * system_rhs.l2_norm());
+    SolverGMRES<BlockVector<double>> solver(solver_control);
 
     solver.solve(system_matrix, solution, system_rhs, preconditioner);
- 
+
     constraints.distribute(solution);
+
+    std::cout << "   Converged in " << solver_control.last_step() << " iterations." << std::endl;
   }
  
  
@@ -919,16 +958,17 @@ namespace Step46
  
  
  
-int main(int argc, char **argv)
+int main(int argc, char *argv[])
 {
   try
     {
       using namespace Step46;
 
-      Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
+      // Initialize MPI (required for Trilinos)
+      Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1); // 1 thread per MPI process
  
       FluidStructureProblem<2> flow_problem(1, 1);
-      flow_problem.run(100, 1e-4);
+      flow_problem.run(10, 1e-4f);
     }
   catch (std::exception &exc)
     {
